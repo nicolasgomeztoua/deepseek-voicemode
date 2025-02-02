@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useRef, useState, useCallback } from "react";
 import { Mic, Send, Loader2, StopCircle } from "lucide-react";
 import Navigation from "./NavBar";
 import { useFetcher } from "@remix-run/react";
@@ -46,25 +46,33 @@ interface TextProcessingData {
 }
 
 const MainInterface = () => {
-  // State
   const [messages, setMessages] = useState<Message[]>([]);
   const [textInput, setTextInput] = useState("");
   const [isRecording, setIsRecording] = useState(false);
-  const [messageCounter, setMessageCounter] = useState(0);
-
-  // Refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  // Fetchers for handling transcription and text processing
   const transcribeFetcher = useFetcher<TranscriptionData>();
   const textFetcher = useFetcher<TextProcessingData>();
 
   const isProcessing =
     transcribeFetcher.state !== "idle" || textFetcher.state !== "idle";
 
-  // Recording handlers
+  const addMessage = useCallback((message: Partial<Message>) => {
+    const fullMessage: Message = {
+      id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: new Date(),
+      ...message,
+    } as Message;
+
+    setMessages((prev) => [...prev, fullMessage]);
+
+    requestAnimationFrame(() => {
+      chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    });
+  }, []);
+
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -109,23 +117,6 @@ const MainInterface = () => {
     }
   };
 
-  // Message handling
-  const addMessage = (message: Partial<Message>) => {
-    setMessageCounter((prev) => prev + 1);
-    const fullMessage: Message = {
-      id: `msg-${messageCounter}`,
-      timestamp: new Date(),
-      ...message,
-    } as Message;
-
-    setMessages((prev) => [...prev, fullMessage]);
-
-    requestAnimationFrame(() => {
-      chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    });
-  };
-
-  // Handle transcription response
   React.useEffect(() => {
     const transcriptionData = transcribeFetcher.data;
 
@@ -136,20 +127,17 @@ const MainInterface = () => {
     ) {
       const transcription = transcriptionData.text;
 
-      // Add transcribed message from user
       addMessage({
         content: transcription,
         type: "user",
         isVoice: true,
       });
 
-      // Add transcription confirmation
       addMessage({
         content: `Transcription (${transcriptionData.language}): "${transcription}"`,
         type: "assistant",
       });
 
-      // Add DeepSeek AI response if available
       if (transcriptionData.ai_response?.response) {
         addMessage({
           content: transcriptionData.ai_response.response,
@@ -167,9 +155,8 @@ const MainInterface = () => {
         type: "assistant",
       });
     }
-  }, [transcribeFetcher.data, transcribeFetcher.state]);
+  }, [transcribeFetcher.data, transcribeFetcher.state, addMessage]);
 
-  // Handle text processing response
   React.useEffect(() => {
     const textData = textFetcher.data;
 
@@ -191,9 +178,8 @@ const MainInterface = () => {
         type: "assistant",
       });
     }
-  }, [textFetcher.data, textFetcher.state]);
+  }, [textFetcher.data, textFetcher.state, addMessage]);
 
-  // Event handlers
   const handleVoiceClick = () => {
     if (isRecording) {
       stopRecording();
@@ -206,13 +192,11 @@ const MainInterface = () => {
     e.preventDefault();
     if (!textInput.trim() || isProcessing) return;
 
-    // Add user message immediately
     addMessage({
       content: textInput,
       type: "user",
     });
 
-    // Submit text for processing
     textFetcher.submit(
       { text: textInput },
       {
@@ -225,7 +209,6 @@ const MainInterface = () => {
     setTextInput("");
   };
 
-  // Status text based on current state
   const statusText = isRecording
     ? "Recording..."
     : isProcessing
@@ -236,24 +219,23 @@ const MainInterface = () => {
     <div className="min-h-screen bg-gradient-to-b from-gray-900 to-black text-white">
       <Navigation />
 
-      <div className="max-w-4xl mx-auto pt-8">
+      <div className="max-w-6xl mx-auto pt-8 px-4">
         <div className="flex flex-col items-center space-y-8">
-          {/* Voice button with deepseek logo */}
           <button
             onClick={handleVoiceClick}
             disabled={isProcessing}
-            className={`relative w-48 h-48 rounded-3xl transition-all duration-300 ${
+            className={`relative w-32 h-32 rounded-3xl transition-all duration-300 ${
               isRecording
                 ? "bg-red-500 shadow-lg shadow-red-500/50"
                 : "bg-blue-500 hover:bg-blue-600 shadow-lg shadow-blue-500/50"
             } ${isProcessing ? "opacity-50 cursor-not-allowed" : ""}`}
           >
             <div className="absolute inset-0 flex items-center justify-center">
-              <div className="w-24 h-24 rounded-xl bg-none backdrop-blur flex items-center justify-center">
+              <div className="w-16 h-16 rounded-xl bg-none backdrop-blur flex items-center justify-center">
                 <img
                   src="/deepseekwhite.png"
                   alt="DeepSeek Logo"
-                  className="w-24 h-24"
+                  className="w-16 h-16"
                 />
               </div>
             </div>
@@ -274,13 +256,11 @@ const MainInterface = () => {
             </div>
           </button>
 
-          {/* Status Text */}
           {statusText && (
             <div className="text-sm text-gray-300">{statusText}</div>
           )}
 
-          {/* Chat Messages */}
-          <div className="w-full max-w-2xl bg-gray-800/30 backdrop-blur rounded-lg p-4 h-96 overflow-y-auto">
+          <div className="w-full bg-gray-800/30 backdrop-blur rounded-lg p-6 h-[50vh] overflow-y-scroll">
             {messages.map((message) => (
               <div
                 key={message.id}
@@ -289,7 +269,7 @@ const MainInterface = () => {
                 }`}
               >
                 <div
-                  className={`inline-block max-w-md px-4 py-2 rounded-lg ${
+                  className={`inline-block max-w-lg px-4 py-2 rounded-lg ${
                     message.type === "user"
                       ? "bg-blue-600 text-white"
                       : message.type === "ai"
@@ -310,8 +290,7 @@ const MainInterface = () => {
             <div ref={chatEndRef} />
           </div>
 
-          {/* Text Input */}
-          <div className="w-full max-w-2xl">
+          <div className="w-full">
             <form onSubmit={handleTextSubmit} className="relative">
               <input
                 type="text"
