@@ -3,13 +3,16 @@ import logging
 from pathlib import Path
 import shutil
 import time
+from collections import defaultdict
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 import whisper
 import tempfile
 import os
 import uvicorn
+import aiofiles
 from fastApiTypes import (
     TranscriptionResponse,
     TranscriptionSegment,
@@ -20,7 +23,8 @@ from fastApiTypes import (
 )
 from dotenv import load_dotenv
 from deepseek_client import DeepSeekClient
-
+from fastapi import Body
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -53,7 +57,6 @@ def cleanup_old_files():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Create temp directory and load model
     global model
     try:
         setup_temp_directory()
@@ -61,11 +64,13 @@ async def lifespan(app: FastAPI):
         model = whisper.load_model("base")
         logger.info("Whisper model loaded successfully")
         yield
+    except whisper.whisper.RuntimeError as e:
+        logger.error(f"Failed to load Whisper model: {e}")
+        raise RuntimeError("Failed to initialize speech recognition model")
     except Exception as e:
         logger.error(f"Startup error: {e}")
         raise
     finally:
-        # Cleanup on shutdown
         try:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir)
@@ -78,6 +83,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -85,6 +91,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate limiting middleware
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: FastAPI, requests_per_minute: int = 60):
+        super().__init__(app)
+        self.requests_per_minute = requests_per_minute
+        self.requests = defaultdict(list)
+    
+    async def dispatch(self, request: Request, call_next):
+        client_ip = request.client.host
+        now = time.time()
+        
+        # Clean old requests
+        self.requests[client_ip] = [req_time for req_time in self.requests[client_ip]
+                                  if now - req_time < 60]
+        
+        # Check rate limit
+        if len(self.requests[client_ip]) >= self.requests_per_minute:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests. Please try again later."
+            )
+        
+        self.requests[client_ip].append(now)
+        return await call_next(request)
+
+# Add rate limiting
+app.add_middleware(RateLimitMiddleware, requests_per_minute=60)
 
 def cleanup_file(file_path: Path):
     """Background task to cleanup a specific file"""
@@ -95,6 +129,20 @@ def cleanup_file(file_path: Path):
     except Exception as e:
         logger.error(f"Error cleaning up file {file_path}: {e}")
 
+async def validate_audio_file(file: UploadFile) -> None:
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="No filename provided"
+        )
+    
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in ['.wav', '.mp3', '.webm', '.mp4']:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format: {file_ext}"
+        )
+
 @app.post("/transcribe", 
           response_model=TranscriptionResponse,
           responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
@@ -102,49 +150,81 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None
 ):
-    # Validate file type
-    if file.content_type not in ALLOWED_AUDIO_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File type not supported. Must be one of: {ALLOWED_AUDIO_TYPES}"
-        )
+    await validate_audio_file(file)
     
     try:
         # Clean up any old files before processing
         cleanup_old_files()
         
-        # Create unique filename for this upload
-        unique_filename = f"{os.urandom(8).hex()}{Path(file.filename).suffix}"
+        # Create unique filename with original extension
+        original_ext = Path(file.filename).suffix
+        unique_filename = f"{os.urandom(8).hex()}{original_ext}"
         file_path = temp_dir / unique_filename
         
-        # Read and validate file size
+        # Read and validate file size with progress tracking
         content = await file.read()
-        if len(content) > MAX_FILE_SIZE:
+        file_size = len(content)
+        
+        if file_size == 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"File size too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB"
+                detail="Empty file provided"
+            )
+            
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File size too large. Maximum size is {MAX_FILE_SIZE/1024/1024:.1f}MB"
             )
         
         # Save file
-        file_path.write_bytes(content)
+        async with aiofiles.open(file_path, 'wb') as out_file:
+            await out_file.write(content)
+            
         logger.info(f"Saved audio file: {file_path}")
         
         # Schedule cleanup
         if background_tasks:
             background_tasks.add_task(cleanup_file, file_path)
         
-        # Transcribe
-        logger.info("Starting transcription...")
-        result = model.transcribe(str(file_path))
-        logger.info("Transcription completed")
+        # Transcribe with error handling
+        try:
+            logger.info("Starting transcription...")
+            result = model.transcribe(str(file_path))
+            logger.info("Transcription completed")
+            
+            if not result or not result.get("text"):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Transcription failed - no text generated"
+                )
+                
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Transcription failed: {str(e)}"
+            )
         
         # Process with DeepSeek
-        logger.info("Processing with DeepSeek...")
-        deepseek_client = DeepSeekClient()
-        ai_response = await deepseek_client.process_voice_input(result["text"])
-        logger.info("DeepSeek processing completed")
+        try:
+            logger.info("Processing with DeepSeek...")
+            deepseek_client = DeepSeekClient()
+            ai_response = await deepseek_client.process_voice_input(result["text"])
+            logger.info("DeepSeek processing completed")
+            
+            if ai_response.error:
+                logger.warning(f"DeepSeek warning: {ai_response.error}")
+                
+        except Exception as e:
+            logger.error(f"DeepSeek error: {e}")
+            # Don't fail the whole request if AI processing fails
+            ai_response = DeepSeekResponse(
+                error=f"AI processing failed: {str(e)}",
+                response=""
+            )
         
-        # Convert result to response model
+        # Construct response
         response = TranscriptionResponse(
             text=result["text"],
             language=result["language"],
@@ -162,21 +242,39 @@ async def transcribe_audio(
             status_code=500,
             detail=f"Error processing request: {str(e)}"
         )
-        
 
 @app.get("/health")
 async def health_check():
-    """Check if the service is healthy and model is loaded"""
+    """Enhanced health check endpoint"""
     if not model:
         raise HTTPException(
             status_code=503,
             detail="Model not loaded"
         )
+    
+    # Check temp directory
+    temp_dir_status = "ok" if temp_dir.exists() else "missing"
+    
+    # Check disk space
+    try:
+        total, used, free = shutil.disk_usage(temp_dir)
+        disk_space = {
+            "total": total // (2**30),  # GB
+            "used": used // (2**30),    # GB
+            "free": free // (2**30)     # GB
+        }
+    except Exception as e:
+        disk_space = {"error": str(e)}
+    
     return {
         "status": "healthy",
         "model": "base",
-        "temp_dir": str(temp_dir),
-        "temp_dir_exists": temp_dir.exists()
+        "temp_dir": {
+            "path": str(temp_dir),
+            "status": temp_dir_status
+        },
+        "disk_space": disk_space,
+        "timestamp": time.time()
     }
 
 @app.get("/config", response_model=ModelConfig)
@@ -189,8 +287,6 @@ async def get_config():
     )
 
 
-from fastapi import FastAPI, Body
-from pydantic import BaseModel
 
 class TextRequest(BaseModel):
     text: str
