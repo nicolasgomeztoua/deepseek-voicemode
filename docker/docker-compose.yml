@@ -1,0 +1,21 @@
+services:
+  transcription:
+    build:
+      context: ../services/transcription
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Only persist the model cache
+      - whisper-models:/root/.cache/whisper
+    networks:
+      - app-network
+
+volumes:
+  whisper-models:
+
+networks:
+  app-network:
+    driver: bridge

@@ -1,6 +1,9 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useRef, useState } from "react";
 import { Mic, Send, Loader2, StopCircle } from "lucide-react";
+import Navigation from "./NavBar";
+import { useFetcher } from "@remix-run/react";
 
+// Message type for chat interface
 interface Message {
   id: string;
   content: string;
@@ -9,20 +12,44 @@ interface Message {
   isVoice?: boolean;
 }
 
-const MainInterface = () => {
-  const [isRecording, setIsRecording] = useState(false);
-  const [textInput, setTextInput] = useState("");
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [messages, setMessages] = useState<Message[]>([]);
+// API Response types
+interface TranscriptionSegment {
+  id: number;
+  seek: number;
+  start: number;
+  end: number;
+  text: string;
+  tokens: number[];
+  temperature: number;
+  avg_logprob: number;
+  compression_ratio: number;
+  no_speech_prob: number;
+}
 
+type TranscriptionData = {
+  text: string;
+  language: string;
+  segments: TranscriptionSegment[];
+  error?: string;
+};
+
+const MainInterface = () => {
+  // State
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [textInput, setTextInput] = useState("");
+  const [isRecording, setIsRecording] = useState(false);
+  const [messageCounter, setMessageCounter] = useState(0); // Add counter for unique IDs
+
+  // Refs for media recording
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  // Fetcher for handling transcription
+  const transcribeFetcher = useFetcher<TranscriptionData>();
+  const isTranscribing = transcribeFetcher.state !== "idle";
 
+  // Recording handlers
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -34,16 +61,26 @@ const MainInterface = () => {
         chunksRef.current.push(e.data);
       };
 
-      mediaRecorder.onstop = () => {
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      mediaRecorder.onstop = async () => {
         const audioBlob = new Blob(chunksRef.current, { type: "audio/webm" });
-        handleVoiceSubmit();
+        const formData = new FormData();
+        formData.append("file", audioBlob, "audio.webm");
+
+        transcribeFetcher.submit(formData, {
+          method: "POST",
+          action: "/transcribe",
+          encType: "multipart/form-data",
+        });
       };
 
       mediaRecorder.start();
       setIsRecording(true);
     } catch (error) {
       console.error("Error accessing microphone:", error);
+      addMessage({
+        content: "Error accessing microphone. Please check your permissions.",
+        type: "assistant",
+      });
     }
   };
 
@@ -57,6 +94,54 @@ const MainInterface = () => {
     }
   };
 
+  // Message handling
+  const addMessage = (message: Partial<Message>) => {
+    setMessageCounter((prev) => prev + 1); // Increment counter for unique ID
+    const fullMessage: Message = {
+      id: `msg-${messageCounter}`, // Use counter in ID to ensure uniqueness
+      timestamp: new Date(),
+      ...message,
+    } as Message;
+
+    setMessages((prev) => [...prev, fullMessage]);
+    // Scroll to bottom after message is added
+    requestAnimationFrame(() => {
+      chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    });
+  };
+
+  // Handle fetcher response
+  React.useEffect(() => {
+    const transcriptionData = transcribeFetcher.data;
+
+    if (
+      transcriptionData &&
+      !transcriptionData.error &&
+      transcribeFetcher.state === "idle"
+    ) {
+      const transcription = transcriptionData.text;
+
+      // Add transcribed message
+      addMessage({
+        content: transcription,
+        type: "user",
+        isVoice: true,
+      });
+
+      // Add AI response
+      addMessage({
+        content: `Here's what I heard: "${transcription}"`,
+        type: "assistant",
+      });
+    } else if (transcriptionData?.error) {
+      addMessage({
+        content: "Sorry, there was an error processing your voice message.",
+        type: "assistant",
+      });
+    }
+  }, [transcribeFetcher.data, transcribeFetcher.state]);
+
+  // Event handlers
   const handleVoiceClick = () => {
     if (isRecording) {
       stopRecording();
@@ -65,69 +150,46 @@ const MainInterface = () => {
     }
   };
 
-  const handleVoiceSubmit = () => {
-    const newMessage: Message = {
-      id: Date.now().toString(),
-      content: "Voice message sent",
-      type: "user",
-      timestamp: new Date(),
-      isVoice: true,
-    };
-    setMessages((prev) => [...prev, newMessage]);
-
-    // Simulate assistant response
-    setIsProcessing(true);
-    setTimeout(() => {
-      const responseMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        content: "I heard your voice message! How can I help you today?",
-        type: "assistant",
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, responseMessage]);
-      setIsProcessing(false);
-    }, 1000);
-  };
-
   const handleTextSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!textInput.trim() || isProcessing) return;
+    if (!textInput.trim() || isTranscribing) return;
 
-    const newMessage: Message = {
-      id: Date.now().toString(),
+    addMessage({
       content: textInput,
       type: "user",
-      timestamp: new Date(),
-    };
-    setMessages((prev) => [...prev, newMessage]);
+    });
 
-    // Simulate assistant response
-    setIsProcessing(true);
-    setTimeout(() => {
-      const responseMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        content: `I received your message: "${textInput}". How can I assist you further?`,
-        type: "assistant",
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, responseMessage]);
-      setIsProcessing(false);
-      setTextInput("");
-    }, 1000);
+    // Add AI response
+    addMessage({
+      content: `I received your message: "${textInput}". How can I assist you further?`,
+      type: "assistant",
+    });
+
+    setTextInput("");
   };
 
+  // Status text based on current state
+  const statusText = isRecording
+    ? "Recording..."
+    : isTranscribing
+    ? "Transcribing..."
+    : "";
+
   return (
-    <div className="min-h-screen bg-gradient-to-b from-gray-900 to-black text-white p-4">
+    <div className="min-h-screen bg-gradient-to-b from-gray-900 to-black text-white">
+      <Navigation />
+
       <div className="max-w-4xl mx-auto pt-8">
         <div className="flex flex-col items-center space-y-8">
           {/* Voice button with deepseek logo */}
           <button
             onClick={handleVoiceClick}
+            disabled={isTranscribing}
             className={`relative w-48 h-48 rounded-3xl transition-all duration-300 ${
               isRecording
                 ? "bg-red-500 shadow-lg shadow-red-500/50"
                 : "bg-blue-500 hover:bg-blue-600 shadow-lg shadow-blue-500/50"
-            }`}
+            } ${isTranscribing ? "opacity-50 cursor-not-allowed" : ""}`}
           >
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="w-24 h-24 rounded-xl bg-none backdrop-blur flex items-center justify-center">
@@ -155,7 +217,12 @@ const MainInterface = () => {
             </div>
           </button>
 
-          {/* Response area */}
+          {/* Status Text */}
+          {statusText && (
+            <div className="text-sm text-gray-300">{statusText}</div>
+          )}
+
+          {/* Chat Messages */}
           <div className="w-full max-w-2xl bg-gray-800/30 backdrop-blur rounded-lg p-4 h-64 overflow-y-auto">
             {messages.map((message) => (
               <div
@@ -184,7 +251,7 @@ const MainInterface = () => {
             <div ref={chatEndRef} />
           </div>
 
-          {/* Text input section */}
+          {/* Text Input */}
           <div className="w-full max-w-2xl">
             <form onSubmit={handleTextSubmit} className="relative">
               <input
@@ -192,14 +259,15 @@ const MainInterface = () => {
                 value={textInput}
                 onChange={(e) => setTextInput(e.target.value)}
                 placeholder="Or type your message here..."
-                className="w-full px-4 py-3 rounded-lg bg-gray-800/50 backdrop-blur border border-gray-700 focus:border-blue-500 focus:ring-2 focus:ring-blue-500 focus:outline-none transition"
+                disabled={isTranscribing}
+                className="w-full px-4 py-3 rounded-lg bg-gray-800/50 backdrop-blur border border-gray-700 focus:border-blue-500 focus:ring-2 focus:ring-blue-500 focus:outline-none transition disabled:opacity-50"
               />
               <button
                 type="submit"
-                disabled={isProcessing || !textInput.trim()}
+                disabled={isTranscribing || !textInput.trim()}
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed transition"
               >
-                {isProcessing ? (
+                {isTranscribing ? (
                   <Loader2 className="w-5 h-5 animate-spin" />
                 ) : (
                   <Send className="w-5 h-5" />
