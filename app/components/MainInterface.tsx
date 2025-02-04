@@ -158,49 +158,49 @@ const MainInterface = () => {
     }
   };
 
-  const handleTextSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!textInput.trim() || isTranscribing) return;
+const handleTextSubmit = async (e: React.FormEvent) => {
+  e.preventDefault();
+  if (!textInput.trim() || isTranscribing) return;
 
-    // Add user message
-    addMessage({
-      content: textInput,
-      type: "user",
+  // Add user message
+  addMessage({
+    content: textInput,
+    type: "user",
+  });
+
+  try {
+    const response = await fetch("/api/textmessage", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message: textInput,
+      }),
     });
 
-    try {
-      const response = await fetch("/api/textmessage", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          message: textInput,
-        }),
-      });
+    const data = await response.json();
 
-      const data = await response.json();
-
-      if (!data.error) {
-        addMessage({
-          content: data.message.content,
-          type: "assistant",
-        });
-      } else {
-        addMessage({
-          content: "Sorry, there was an error getting a response.",
-          type: "assistant",
-        });
-      }
-    } catch (error) {
+    if (!data.error) {
       addMessage({
-        content: "Sorry, there was an error processing your message.",
+        content: data.message.content,
+        type: "assistant",
+      });
+    } else {
+      addMessage({
+        content: "Sorry, there was an error getting a response.",
         type: "assistant",
       });
     }
+  } catch (error) {
+    addMessage({
+      content: "Sorry, there was an error processing your message.",
+      type: "assistant",
+    });
+  }
 
-    setTextInput("");
-  };
+  setTextInput("");
+};
 
   // Status text based on current state
   const statusText = isRecording
