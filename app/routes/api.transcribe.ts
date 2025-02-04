@@ -1,6 +1,5 @@
-// app/routes/transcribe.ts
+// app/routes/transcribe.server.ts
 import type { ActionFunction } from "@remix-run/node";
-import { queryDeepSeek } from "~/services/query-deepseek";
 
 export const action: ActionFunction = async ({ request }) => {
   try {
@@ -15,33 +14,21 @@ export const action: ActionFunction = async ({ request }) => {
     }
 
     // Send to Python FastAPI service
-    const transcriptionResponse = await fetch(
-      "http://localhost:8000/transcribe",
-      {
-        method: "POST",
-        body: formData,
-      }
-    );
+    const response = await fetch("http://localhost:8000/transcribe", {
+      method: "POST",
+      body: formData,
+    });
 
-    if (!transcriptionResponse.ok) {
-      throw new Error(`Transcription error: ${transcriptionResponse.status}`);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
     }
 
-    const transcriptionData = await transcriptionResponse.json();
-
-    // Query DeepSeek with transcribed text
-    const deepseekResponse = await queryDeepSeek([
-      { role: "user", content: transcriptionData.text },
-    ]);
-
-    return Response.json({
-      transcription: transcriptionData,
-      response: deepseekResponse,
-    });
+    const transcription = await response.json();
+    return Response.json(transcription);
   } catch (error) {
-    console.error("Processing error:", error);
+    console.error("Transcription error:", error);
     return Response.json(
-      { error: "Failed to process request" },
+      { error: "Failed to transcribe audio" },
       { status: 500 }
     );
   }
