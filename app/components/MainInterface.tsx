@@ -1,7 +1,8 @@
-import React, { useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Mic, Send, Loader2, StopCircle } from "lucide-react";
 import Navigation from "./NavBar";
 import { useFetcher } from "@remix-run/react";
+import { DeepSeekResponse, DeepSeekResult } from "~/types/deepseek";
 
 // Message type for chat interface
 interface Message {
@@ -10,6 +11,12 @@ interface Message {
   type: "user" | "assistant";
   timestamp: Date;
   isVoice?: boolean;
+  deepseekResponse?: DeepSeekResult;
+}
+
+interface CombinedResponse {
+  transcription: TranscriptionData;
+  response: DeepSeekResult;
 }
 
 // API Response types
@@ -38,7 +45,6 @@ const MainInterface = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [textInput, setTextInput] = useState("");
   const [isRecording, setIsRecording] = useState(false);
-  const [messageCounter, setMessageCounter] = useState(0); // Add counter for unique IDs
 
   // Refs for media recording
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -46,7 +52,7 @@ const MainInterface = () => {
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   // Fetcher for handling transcription
-  const transcribeFetcher = useFetcher<TranscriptionData>();
+  const transcribeFetcher = useFetcher<CombinedResponse>();
   const isTranscribing = transcribeFetcher.state !== "idle";
 
   // Recording handlers
@@ -68,7 +74,7 @@ const MainInterface = () => {
 
         transcribeFetcher.submit(formData, {
           method: "POST",
-          action: "/transcribe",
+          action: "/api/transcribe",
           encType: "multipart/form-data",
         });
       };
@@ -95,51 +101,53 @@ const MainInterface = () => {
   };
 
   // Message handling
-  const addMessage = (message: Partial<Message>) => {
-    setMessageCounter((prev) => prev + 1); // Increment counter for unique ID
+  const addMessage = useCallback((message: Partial<Message>) => {
     const fullMessage: Message = {
-      id: `msg-${messageCounter}`, // Use counter in ID to ensure uniqueness
+      id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       timestamp: new Date(),
       ...message,
     } as Message;
 
     setMessages((prev) => [...prev, fullMessage]);
-    // Scroll to bottom after message is added
+
     requestAnimationFrame(() => {
       chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
     });
-  };
+  }, []);
 
   // Handle fetcher response
-  React.useEffect(() => {
-    const transcriptionData = transcribeFetcher.data;
+  useEffect(() => {
+    const response = transcribeFetcher.data;
 
-    if (
-      transcriptionData &&
-      !transcriptionData.error &&
-      transcribeFetcher.state === "idle"
-    ) {
-      const transcription = transcriptionData.text;
+    if (response && transcribeFetcher.state === "idle") {
+      if (!response.transcription.error) {
+        // Add transcribed message
+        addMessage({
+          content: response.transcription.text,
+          type: "user",
+          isVoice: true,
+        });
 
-      // Add transcribed message
-      addMessage({
-        content: transcription,
-        type: "user",
-        isVoice: true,
-      });
-
-      // Add AI response
-      addMessage({
-        content: `Here's what I heard: "${transcription}"`,
-        type: "assistant",
-      });
-    } else if (transcriptionData?.error) {
-      addMessage({
-        content: "Sorry, there was an error processing your voice message.",
-        type: "assistant",
-      });
+        // Add AI response
+        if (response.response) {
+          addMessage({
+            content: (response.response as DeepSeekResponse).message.content,
+            type: "assistant",
+          });
+        } else {
+          addMessage({
+            content: "Sorry, there was an error getting a response.",
+            type: "assistant",
+          });
+        }
+      } else {
+        addMessage({
+          content: "Sorry, there was an error processing your voice message.",
+          type: "assistant",
+        });
+      }
     }
-  }, [transcribeFetcher.data, transcribeFetcher.state]);
+  }, [addMessage, transcribeFetcher.data, transcribeFetcher.state]);
 
   // Event handlers
   const handleVoiceClick = () => {
@@ -150,23 +158,49 @@ const MainInterface = () => {
     }
   };
 
-  const handleTextSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!textInput.trim() || isTranscribing) return;
+const handleTextSubmit = async (e: React.FormEvent) => {
+  e.preventDefault();
+  if (!textInput.trim() || isTranscribing) return;
 
-    addMessage({
-      content: textInput,
-      type: "user",
+  // Add user message
+  addMessage({
+    content: textInput,
+    type: "user",
+  });
+
+  try {
+    const response = await fetch("/api/textmessage", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message: textInput,
+      }),
     });
 
-    // Add AI response
+    const data = await response.json();
+
+    if (!data.error) {
+      addMessage({
+        content: data.message.content,
+        type: "assistant",
+      });
+    } else {
+      addMessage({
+        content: "Sorry, there was an error getting a response.",
+        type: "assistant",
+      });
+    }
+  } catch (error) {
     addMessage({
-      content: `I received your message: "${textInput}". How can I assist you further?`,
+      content: "Sorry, there was an error processing your message.",
       type: "assistant",
     });
+  }
 
-    setTextInput("");
-  };
+  setTextInput("");
+};
 
   // Status text based on current state
   const statusText = isRecording
@@ -223,7 +257,7 @@ const MainInterface = () => {
           )}
 
           {/* Chat Messages */}
-          <div className="w-full max-w-2xl bg-gray-800/30 backdrop-blur rounded-lg p-4 h-64 overflow-y-auto">
+          <div className="w-full max-w-7xl h-[50vh] bg-gray-800/30 backdrop-blur rounded-lg p-4  overflow-y-auto">
             {messages.map((message) => (
               <div
                 key={message.id}
@@ -248,11 +282,17 @@ const MainInterface = () => {
                 </div>
               </div>
             ))}
+            {transcribeFetcher.state !== "idle" && (
+              <div className="flex items-center justify-center py-2">
+                <Loader2 className="w-5 h-5 animate-spin text-gray-400" />
+                <span className="ml-2 text-gray-400">Processing...</span>
+              </div>
+            )}
             <div ref={chatEndRef} />
           </div>
 
           {/* Text Input */}
-          <div className="w-full max-w-2xl">
+          <div className="w-full max-w-7xl">
             <form onSubmit={handleTextSubmit} className="relative">
               <input
                 type="text"
